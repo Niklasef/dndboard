@@ -67,6 +67,31 @@ Foundry keeps a hidden token for each miniature, and the token follows the physi
 4. **Connect Foundry:** drive Foundry's hidden tokens from the physical miniatures.
 5. **Build the real table:** the large horizontal display, the calibrated grid and the DM screen.
 
+## Running the Prototype
+
+Setup:
+
+```
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+```
+
+Run:
+
+```
+.venv/bin/python detect.py                  # all photos in images/mixed/
+.venv/bin/python detect.py path/to/photo.jpg
+```
+
+**How it works:** the photo is lined up with a photo of the empty table, and whatever changed is a miniature. Each one is compared with reference photos of every character and gets the best-matching label, or `unknown` if it is not sure.
+
+**Input (`images/`, not in git):**
+- `empty-board.jpg`: the empty table.
+- One folder per character (e.g. `goblin/`), with photos of that miniature from several angles. The folder name is the label.
+- `mixed/`: the photos to label.
+
+**Output:** one JSON line per photo on stdout (label, position and match scores per miniature), plus an annotated image per photo in `out/`.
+
 ## Prototype Hardware
 
 - Linux computer
