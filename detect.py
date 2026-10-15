@@ -12,14 +12,15 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+import torch
 
 IMAGES = Path("images")
 OUT = Path("out")
 SCALE = 0.5  # detection works at half resolution
 DIFF_THRESHOLD = 20  # LAB distance that counts as "something changed"
 MIN_AREA = 1500  # px at working scale; smaller blobs are noise
-MIN_INLIERS = 15  # matches that agree on one transform before we trust a label
-MIN_MARGIN = 1.5  # best character must beat the runner-up by this factor
+MIN_SIM = 0.3  # cosine similarity the best character needs before we trust a label
+MIN_GAP = 0.05  # best character must beat the runner-up by this much
 PINK = (180, 80, 255)  # BGR
 YELLOW = (0, 220, 255)
 
@@ -28,7 +29,9 @@ MAT = np.array([(400, 60), (1110, 60), (1110, 1060), (240, 1060)], np.int32)
 
 sift = cv2.SIFT_create()
 matcher = cv2.BFMatcher()
-clahe = cv2.createCLAHE(2.0, (4, 4))
+model = torch.hub.load("facebookresearch/dinov2", "dinov2_vits14").eval()
+MEAN = np.array([0.485, 0.456, 0.406], np.float32)
+STD = np.array([0.229, 0.224, 0.225], np.float32)
 
 
 def load(path):
@@ -65,7 +68,7 @@ def changed_mask(img, ref, mask):
 
 
 def find_minis(path, ref, mask):
-    """Return the aligned half-res photo, the changed mask, bounding boxes and SIFT features per box."""
+    """Return the aligned half-res photo, the changed mask, bounding boxes and an embedding per box."""
     full, small = load(path)
     H = homography(small, ref, mask)
     h, w = ref.shape[:2]
@@ -80,34 +83,35 @@ def find_minis(path, ref, mask):
 
     contours, _ = cv2.findContours(changed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     boxes = [cv2.boundingRect(c) for c in contours if cv2.contourArea(c) >= MIN_AREA]
-    feats = [features(full_aligned, full_changed, b) for b in boxes]
+    feats = [embed(full_aligned, full_changed, b) for b in boxes]
     return aligned, changed, boxes, feats
 
 
-def features(img, changed, box):
+def embed(img, changed, box):
+    """DINOv2 embedding of just the miniature, on a neutral background."""
     x, y, w, h = [round(v / SCALE) for v in box]
-    gray = clahe.apply(cv2.cvtColor(img[y:y + h, x:x + w], cv2.COLOR_BGR2GRAY))
-    # Only look at the miniature itself; the mat texture matches every character equally well
-    return sift.detectAndCompute(gray, changed[y:y + h, x:x + w])
+    crop = img[y:y + h, x:x + w].copy()
+    # Only look at the miniature itself; the mat texture would otherwise sway the result
+    crop[changed[y:y + h, x:x + w] == 0] = 128
+    side = max(w, h)
+    square = cv2.copyMakeBorder(crop, (side - h) // 2, side - h - (side - h) // 2,
+                                (side - w) // 2, side - w - (side - w) // 2,
+                                cv2.BORDER_CONSTANT, value=(128, 128, 128))
+    rgb = cv2.cvtColor(cv2.resize(square, (224, 224), interpolation=cv2.INTER_AREA), cv2.COLOR_BGR2RGB)
+    tensor = torch.from_numpy(((rgb / 255.0 - MEAN) / STD).astype(np.float32)).permute(2, 0, 1)[None]
+    with torch.no_grad():
+        v = model(tensor)[0]
+    return (v / v.norm()).numpy()
 
 
-def match_score(f, f_ref):
-    """Number of feature matches that agree on a single rotation/scale/shift."""
-    (k, d), (k_ref, d_ref) = f, f_ref
-    if d is None or d_ref is None or len(d) < 2 or len(d_ref) < 2:
-        return 0
-    pairs = matcher.knnMatch(d, d_ref, k=2)
-    good = [p[0] for p in pairs if len(p) == 2 and p[0].distance < 0.8 * p[1].distance]
-    if len(good) < 4:
-        return 0
-    src = np.float32([k[m.queryIdx].pt for m in good])
-    dst = np.float32([k_ref[m.trainIdx].pt for m in good])
-    _, inliers = cv2.estimateAffinePartial2D(src, dst, method=cv2.RANSAC, ransacReprojThreshold=12)
-    return 0 if inliers is None else int(inliers.sum())
+def center(v, mu):
+    """All miniatures are dark grey, so their embeddings share a big common part; remove it."""
+    v = v - mu
+    return v / np.linalg.norm(v)
 
 
 def load_refs(ref, mask):
-    """Features of each reference photo, keyed by character (the folder name)."""
+    """Embeddings of each reference photo, keyed by character (the folder name), and their mean."""
     refs = {}
     for folder in sorted(p for p in IMAGES.iterdir() if p.is_dir() and p.name != "mixed"):
         refs[folder.name] = []
@@ -116,23 +120,24 @@ def load_refs(ref, mask):
             if boxes:
                 biggest = max(range(len(boxes)), key=lambda i: boxes[i][2] * boxes[i][3])
                 refs[folder.name].append(feats[biggest])
-    return refs
+    mu = np.mean([r for rs in refs.values() for r in rs], axis=0)
+    return {name: [center(r, mu) for r in rs] for name, rs in refs.items()}, mu
 
 
 def identify(f, refs):
-    scores = {name: max((match_score(f, r) for r in rs), default=0) for name, rs in refs.items()}
+    scores = {name: max(float(f @ r) for r in rs) for name, rs in refs.items()}
     (best, top), (_, second) = sorted(scores.items(), key=lambda kv: -kv[1])[:2]
-    sure = top >= MIN_INLIERS and top >= MIN_MARGIN * second
+    sure = top >= MIN_SIM and top - second >= MIN_GAP
     return (best if sure else "unknown"), scores
 
 
-def detect(path, ref, mask, refs):
+def detect(path, ref, mask, refs, mu):
     aligned, changed, boxes, feats = find_minis(path, ref, mask)
     minis = []
     annotated = aligned.copy()
     for box, f in zip(boxes, feats):
-        label, scores = identify(f, refs)
-        minis.append({"label": label, "bbox": [round(v / SCALE) for v in box], "scores": scores})
+        label, scores = identify(center(f, mu), refs)
+        minis.append({"label": label, "bbox": [round(v / SCALE) for v in box], "scores": {k: round(v, 3) for k, v in scores.items()}})
         x, y, w, h = box
         color = YELLOW if label == "unknown" else PINK
         cv2.rectangle(annotated, (x, y), (x + w, y + h), color, 3)
@@ -155,10 +160,10 @@ def main():
     _, ref = load(IMAGES / "empty-board.jpg")
     mask = np.zeros(ref.shape[:2], np.uint8)
     cv2.fillPoly(mask, [MAT], 255)
-    refs = load_refs(ref, mask)
+    refs, mu = load_refs(ref, mask)
     paths = [Path(p) for p in sys.argv[1:]] or sorted((IMAGES / "mixed").glob("*.jpg"))
     for path in paths:
-        print(json.dumps(detect(path, ref, mask, refs)))
+        print(json.dumps(detect(path, ref, mask, refs, mu)))
 
 
 if __name__ == "__main__":
